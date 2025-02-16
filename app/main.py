@@ -16,20 +16,15 @@
 #   "pydantic",
 # ]
 # ///
-from typing import Any, Dict, Callable, Optional
-import os
-import json
-import logging
 import traceback
-from pathlib import Path
-from contextlib import contextmanager
-
-import requests
-import uvicorn
+import json
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Response
+import requests
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
-
+import os
+import logging
+from typing import Dict, Callable
 from funtion_tasks import (
     format_file_with_prettier,
     convert_function_to_openai_schema,
@@ -47,125 +42,131 @@ from funtion_tasks import (
     install_and_run_script,
 )
 
-class ConfigurationManager:
-    def __init__(self):
-        load_dotenv()
-        self.api_token = os.getenv("AIPROXY_TOKEN")
-        self.api_endpoints = {
-            "chat": "http://aiproxy.sanand.workers.dev/openai/v1/chat/completions",
-            "embedding": "http://aiproxy.sanand.workers.dev/openai/v1/embeddings"
-        }
-        self.environment = {
-            "is_codespaces": "CODESPACES" in os.environ,
-            "is_docker": os.path.exists("/.dockerenv")
-        }
 
-class TaskProcessor:
-    def __init__(self, config: ConfigurationManager):
-        self.config = config
-        self.available_functions = {
-            "install_and_run_script": install_and_run_script,
-            "format_file_with_prettier": format_file_with_prettier,
-            "query_database": query_database,
-            "extract_specific_text_using_llm": extract_specific_text_using_llm,
-            "get_similar_text_using_embeddings": get_similar_text_using_embeddings,
-            "extract_text_from_image": extract_text_from_image,
-            "extract_specific_content_and_create_index": extract_specific_content_and_create_index,
-            "process_and_write_logfiles": process_and_write_logfiles,
-            "sort_json_by_keys": sort_json_by_keys,
-            "count_occurrences": count_occurrences,
-        }
+load_dotenv()
+AUTH_TOKEN = os.getenv("AIPROXY_TOKEN")
+COMPLETION_ENDPOINT = "http://aiproxy.sanand.workers.dev/openai/v1/chat/completions"
+VECTOR_ENDPOINT = "http://aiproxy.sanand.workers.dev/openai/v1/embeddings"
 
-    def normalize_path(self, file_path: str) -> str:
-        if not self.config.environment["is_codespaces"] and self.config.environment["is_docker"]:
-            return file_path
+app = FastAPI()
+
+RUNNING_IN_CODESPACES = "CODESPACES" in os.environ
+RUNNING_IN_DOCKER = os.path.exists("/.dockerenv")
+logging.basicConfig(level=logging.INFO)
+
+
+def ensure_local_path(file_path: str) -> str:
+    """Ensure the path uses './data/...' locally, but '/data/...' in Docker."""
+    if (not RUNNING_IN_CODESPACES) and RUNNING_IN_DOCKER:
+        print(
+            "IN HERE", RUNNING_IN_DOCKER
+        )  # If absolute Docker path, return as-is :  # If absolute Docker path, return as-is
+        return file_path
+
+    else:
+        logging.info(f"Inside ensure_local_path with path: {file_path}")
         return file_path.lstrip("/")
 
-    def analyze_task(self, task_description: str, available_tools: list) -> dict:
-        response = requests.post(
-            self.config.api_endpoints["chat"],
-            headers={
-                "Authorization": f"Bearer {self.config.api_token}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are an advanced task analyzer that identifies optimal tool functions for achieving desired outcomes.",
-                    },
-                    {"role": "user", "content": task_description},
-                ],
-                "tools": available_tools,
-                "tool_choice": "required",
-            },
+
+operation_registry: Dict[str, Callable] = {
+    "install_and_run_script": install_and_run_script,
+    "format_file_with_prettier": format_file_with_prettier,
+    "query_database": query_database,
+    "extract_specific_text_using_llm": extract_specific_text_using_llm,
+    "get_similar_text_using_embeddings": get_similar_text_using_embeddings,
+    "extract_text_from_image": extract_text_from_image,
+    "extract_specific_content_and_create_index": extract_specific_content_and_create_index,
+    "process_and_write_logfiles": process_and_write_logfiles,
+    "sort_json_by_keys": sort_json_by_keys,
+    "count_occurrences": count_occurrences,
+}
+
+
+def parse_task_description(instruction_text: str, available_tools: list):
+    api_response = requests.post(
+        COMPLETION_ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {AUTH_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "ou are a smart assistant capable of comprehending and analyzing tasks. You swiftly determine the most effective tool functions to achieve the desired outcomes.",
+                },
+                {"role": "user", "content": instruction_text},
+            ],
+            "tools": available_tools,
+            "tool_choice": "required",
+        },
+    )
+    return api_response.json()["choices"][0]["message"]
+
+
+def execute_function_call(operation_call):
+    logging.info(f"Inside execute_function_call with operation_call: {operation_call}")
+    try:
+        operation_name = operation_call["name"]
+        operation_args = json.loads(operation_call["arguments"])
+        operation_handler = operation_registry.get(operation_name)
+        logging.info("PRINTING RESPONSE:::" * 3)
+        print("Calling function:", operation_name)
+        print("Arguments:", operation_args)
+        if operation_handler:
+            operation_handler(**operation_args)
+        else:
+            raise ValueError(f"Function {operation_name} not found")
+    except Exception as e:
+        error_details = traceback.format_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error executing function in execute_function_call: {str(e)}",
+            headers={"X-Traceback": error_details},
         )
-        return response.json()["choices"][0]["message"]
 
-    def execute_tool(self, tool_call: dict) -> None:
-        try:
-            tool_name = tool_call["name"]
-            tool_args = json.loads(tool_call["arguments"])
-            
-            if tool_func := self.available_functions.get(tool_name):
-                logging.info(f"Executing tool: {tool_name}")
-                logging.info(f"Arguments: {tool_args}")
-                tool_func(**tool_args)
-            else:
-                raise ValueError(f"Unknown tool: {tool_name}")
-        except Exception as e:
-            error_trace = traceback.format_exc()
-            raise HTTPException(
-                status_code=500,
-                detail=f"Tool execution failed: {str(e)}",
-                headers={"X-Error-Trace": error_trace},
-            )
 
-class APIServer:
-    def __init__(self):
-        self.config = ConfigurationManager()
-        self.processor = TaskProcessor(self.config)
-        self.app = FastAPI()
-        self._setup_routes()
-        logging.basicConfig(level=logging.INFO)
+@app.post("/run")
+async def run_task(
+    instruction: str = Query(..., description="Plain-English task description")
+):
+    available_tools = [
+        convert_function_to_openai_schema(func) for func in operation_registry.values()
+    ]
+    logging.info(len(available_tools))
+    logging.info(f"Inside run_task with task: {instruction}")
+    try:
+        operation_response = parse_task_description(
+            instruction, available_tools
+        )  # returns  message from response
+        if operation_response["tool_calls"]:
+            for operation in operation_response["tool_calls"]:
+                execute_function_call(operation["function"])
+        return {"status": "success", "message": "Task executed successfully"}
+    except Exception as e:
+        error_details = traceback.format_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error executing function in run_task: {str(e)}",
+            headers={"X-Traceback": error_details},
+        )
 
-    def _setup_routes(self):
-        @self.app.post("/run")
-        async def handle_task(task: str = Query(..., description="Natural language task description")):
-            try:
-                tools = [convert_function_to_openai_schema(func) 
-                        for func in self.processor.available_functions.values()]
-                
-                task_analysis = self.processor.analyze_task(task, tools)
-                
-                if task_analysis.get("tool_calls"):
-                    for tool in task_analysis["tool_calls"]:
-                        self.processor.execute_tool(tool["function"])
-                
-                return {"status": "success", "message": "Task completed successfully"}
-            except Exception as e:
-                error_trace = traceback.format_exc()
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Task execution failed: {str(e)}",
-                    headers={"X-Error-Trace": error_trace},
-                )
 
-        @self.app.get("/read", response_class=PlainTextResponse)
-        async def read_content(path: str = Query(..., description="Target file path")):
-            try:
-                file_path = self.processor.normalize_path(path)
-                if not Path(file_path).exists():
-                    raise FileNotFoundError(f"File not found: {file_path}")
-                    
-                return Path(file_path).read_text()
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"File reading failed: {str(e)}")
+@app.get("/read", response_class=PlainTextResponse)
+async def read_file(file_path: str = Query(..., description="Path to the file to read")):
+    logging.info(f"Inside read_file with path: {file_path}")
+    target_path = ensure_local_path(file_path)
+    if not os.path.exists(target_path):
+        raise HTTPException(
+            status_code=500, detail=f"Error executing function in read_file (GET API"
+        )
+    with open(target_path, "r") as file:
+        file_content = file.read()
+    return file_content
 
-    def start(self):
-        uvicorn.run(self.app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
-    server = APIServer()
-    server.start()
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
